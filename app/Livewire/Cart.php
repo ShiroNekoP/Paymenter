@@ -7,6 +7,7 @@ use App\Classes\Price;
 use App\Exceptions\DisplayException;
 use App\Helpers\ExtensionHelper;
 use App\Jobs\Server\CreateJob;
+use App\Livewire\Component;
 use App\Models\Invoice;
 use App\Models\Order;
 use App\Models\Service;
@@ -14,7 +15,7 @@ use App\Models\User;
 use Exception;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Support\Once;
 use Livewire\Attributes\Locked;
 
 class Cart extends Component
@@ -24,6 +25,8 @@ class Cart extends Component
 
     public $gateway;
 
+    public $gateways = [];
+
     public $coupon;
 
     public $use_credits = true;
@@ -32,6 +35,10 @@ class Cart extends Component
 
     public function mount()
     {
+        // Initialize default values
+        $this->gateway = $this->gateway ?? null;
+        $this->gateways = $this->gateways ?? [];
+
         if (ClassesCart::get()->coupon_id) {
             $this->coupon = ClassesCart::get()->coupon;
         }
@@ -47,7 +54,7 @@ class Cart extends Component
         }
         $this->total = new Price(['price' => ClassesCart::items()->sum(fn ($item) => $item->price->total * $item->quantity), 'currency' => ClassesCart::get()->currency]);
         $this->gateways = ExtensionHelper::getCheckoutGateways($this->total->total, $this->total->currency->code, 'cart', ClassesCart::items());
-        if (count($this->gateways) > 0 && !array_search($this->gateway, array_column($this->gateways, 'id')) !== false) {
+        if (count($this->gateways) > 0 && array_search($this->gateway, array_column($this->gateways, 'id')) === false) {
             $this->gateway = $this->gateways[0]->id;
         }
     }
@@ -57,13 +64,6 @@ class Cart extends Component
         if ($this->coupon && ClassesCart::get()->coupon_id) {
             return $this->notify('Coupon code already applied', 'error');
         }
-        // Rate limit to prevent abuse
-        if (RateLimiter::tooManyAttempts('apply_coupon_' . request()->ip(), 5)) {
-            return $this->notify('Too many attempts. Please try again later.', 'error');
-        }
-
-        RateLimiter::hit('apply_coupon_' . request()->ip());
-
         try {
             $cart = ClassesCart::applyCoupon($this->coupon);
         } catch (DisplayException $e) {
@@ -72,7 +72,12 @@ class Cart extends Component
 
             return;
         }
-        $this->coupon = $cart->coupon;
+
+
+        Once::flush();
+
+        ClassesCart::get()->load('coupon', 'items.plan', 'items.product', 'items.product.configOptions.children.plans.prices');
+        $this->coupon = ClassesCart::get()->coupon;
         $this->updateTotal();
         $this->notify('Coupon code applied successfully', 'success');
     }
@@ -84,6 +89,10 @@ class Cart extends Component
         }
         ClassesCart::removeCoupon();
         $this->coupon = null;
+
+
+        Once::flush();
+
         $this->updateTotal();
         $this->notify('Coupon code removed successfully', 'success');
     }
@@ -171,7 +180,7 @@ class Cart extends Component
             // Create the services
             foreach ($cart->items as $item) {
                 // Is it a lifetime coupon, then we can adjust the price of the service
-                if (is_object($this->coupon) && ($this->coupon->recurring === null || (int) $this->coupon->recurring == 1)) {
+                if ($this->coupon && ($this->coupon->recurring === null || (int) $this->coupon->recurring == 1)) {
                     // Apply coupon only to first billing cycle (use original price for recurring)
                     $price = $item->price->original_price;
                 } else {
@@ -199,7 +208,7 @@ class Cart extends Component
 
                 foreach ($item->config_options as $configOption) {
                     $configOption = (object) $configOption;
-                    if (in_array($configOption->option_type, ['text', 'number'])) {
+                    if ($configOption->option_type === 'text') {
                         if (!isset($configOption->value)) {
                             continue;
                         }
@@ -209,6 +218,28 @@ class Cart extends Component
                             'name' => $configOption->option_name,
                             'value' => $configOption->value,
                         ]);
+
+                        continue;
+                    }
+                    if ($configOption->option_type === 'number') {
+                        if (!isset($configOption->value)) {
+                            continue;
+                        }
+                        $service->properties()->updateOrCreate([
+                            'key' => $configOption->option_env_variable ? $configOption->option_env_variable : $configOption->option_name,
+                        ], [
+                            'name' => $configOption->option_name,
+                            'value' => $configOption->value,
+                        ]);
+                        // Also store the raw value for pricing calculations
+                        if (isset($configOption->raw_value)) {
+                            $service->properties()->updateOrCreate([
+                                'key' => ($configOption->option_env_variable ? $configOption->option_env_variable : $configOption->option_name) . '_raw',
+                            ], [
+                                'name' => $configOption->option_name . ' (Raw Input)',
+                                'value' => $configOption->raw_value,
+                            ]);
+                        }
 
                         continue;
                     }
@@ -242,11 +273,39 @@ class Cart extends Component
                 }
             }
 
+            // Apply credits if enabled
+            
+            if ($this->use_credits && $this->total->price > 0) {
+                $credit = Auth::user()->credits()->where('currency_code', $this->total->currency->code)->lockForUpdate()->first();
+                if ($credit && $credit->amount > 0) {
+                    // Check if credit covers entire invoice
+                    if ($credit->amount >= $this->total->price) {
+                        // Apply full payment
+                        $credit->amount -= $this->total->price;
+                        $credit->save();
+                        ExtensionHelper::addPayment($invoice->id, null, amount: $this->total->price, isCreditTransaction: true);
+                        // Set total to 0 since fully paid
+                        $this->total->price = 0;
+                    } else {
+                        // Apply partial payment
+                        $this->total->price -= $credit->amount;
+                        ExtensionHelper::addPayment($invoice->id, null, amount: $credit->amount, isCreditTransaction: true);
+                        $credit->amount = 0;
+                        $credit->save();
+                    }
+                }
+            }
+
             // Commit the transaction
             DB::commit();
 
             // Clear the cart
             ClassesCart::clear();
+
+
+            if (isset($this->gateway) && $this->gateway) {
+                session(['gateway' => $this->gateway]);
+            }
 
             if ($this->total->price == 0) {
                 // Is it only one item? Then redirect to the service page

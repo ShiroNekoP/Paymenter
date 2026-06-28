@@ -3,6 +3,9 @@
 /public/default/*
 /public/hot
 /public/storage
+/public/citadel
+/public/assets/icons/citadel
+/public/modules/gateways/callback
 /storage/*.key
 /vendor
 .env
@@ -21,4 +24,11 @@ themes/*
 extensions/Others/Pages
 extensions/Servers/LicenseManager
 extensions/Servers/Proxmox
+extensions/Gateways/EasyPay
+extensions/Others/CitadelEditor
+extensions/Others/FreeTrial
+extensions/Others/Onboarding
+extensions/Others/PricingDiscounts
+extensions/Others/SelectablePayments
 !themes/default
+/app/Livewire/cart.php.bak
